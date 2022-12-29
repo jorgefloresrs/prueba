@@ -1,0 +1,294 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  IAMStackname:
+    Type: String
+    Default: "DEMO-IAM-PERMISSIONS-PIPELINE"
+    Description: Pipeline IAM permissions
+  emailNotification:
+    Type: String
+    Description: Email ID to send notifications
+    Default: jorge.flores@rackspace.com
+  GitHubRepositoryName:
+    Type: String
+    Default: 'jorgefloresrs/test-pipelines'
+    Description: >
+      Name of the GitHub repository containing the CloudFormation template being deployed. For this
+      example, most likely would be "aws-cloudformation-pipeline-example" but might be different if
+      you changed the name of the forked repository
+  GitHubIntegrationBranch:
+    Type: String
+    Default: main
+    Description: >
+      Git branch on which integration occurs. Typical value here would be "master" but might differ
+      for your specific use case
+  DeploymentStackName:
+    Type: String
+    Description: >
+      Name to give the production stack that is deployed as part of the pipeline
+    Default: infra-pipeline-resources
+
+Resources:
+  snsApprovalNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'Manual-Approval-Notification-Infra'
+      FifoTopic: false
+      Tags:
+        - Key: Team
+          Value: RackspaceEE
+      TopicName: 'Manual-Approval-Notification-Infra'
+
+  snsApprovalSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref emailNotification
+      Protocol: 'email'
+      TopicArn: !Ref snsApprovalNotification
+
+  snsPipelinesNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "DEMO-Events-Infra"
+      FifoTopic: false
+      Tags:
+        - Key: Team
+          Value: RackspaceEE
+      TopicName: "DEMO-Events-Infra"
+
+  snsPipelineSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref emailNotification
+      Protocol: 'email'
+      TopicArn: !Ref snsPipelinesNotification
+
+  # S3 Bucket to hold artifacts for the Pipeline. Only requirement is that the S3 bucket has
+  # versioning enabled. Other settings are following best practices for S3 buckets (encryption,
+  # access logging, blocking public access)
+  PipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'demo-infra-pipeline-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: 'Suspended'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+
+  CodePipelineStateFailureEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: cwe-pipeline-execution
+      Description: 'A CloudWatch Event Rule that sends a notification to provide notice over failed events from Infrastructure pipeline'
+      State: 'ENABLED'
+      Targets:
+        - Arn:
+            Ref: 'snsPipelinesNotification'
+          Id: "OpsTopic"
+          InputTransformer:
+            InputTemplate: '"The Pipeline has failed. Go to https://console.aws.amazon.com/codepipeline/home?region=us-east-1#/view/"'
+            InputPathsMap:
+              pipeline: "$.detail.pipeline"
+      EventPattern:
+        detail-type:
+          - 'CodePipeline Pipeline Execution State Change'
+        source:
+          - 'aws.codepipeline'
+        detail:
+          event:
+            - FAILED
+      RoleArn:
+          Fn::ImportValue: !Sub '${IAMStackname}-AmazonCloudWatchEventRole'
+
+  CodebuildStateFailureEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: "Rule for sending failure notifications to SNS topic"
+      EventPattern:
+        source:
+          - aws.codebuild
+        detail-type:
+          - CodeBuild Build State Change
+        detail:
+          project-name:
+            - CodeBuildProjects
+          build-status:
+            - FAILED
+      State: "ENABLED"
+      Targets:
+        - Arn: !Ref 'snsPipelinesNotification'
+          Id: "CodeBuildNotifications"
+          InputTransformer:
+            InputTemplate: '"The project <project-name> has the next status: <build-status>. You can check <deep-link>"'
+            InputPathsMap:
+              project-name: "$.detail.project-name"
+              build-status: "$.detail.build-status"
+              deep-link: "$.detail.additional-information.logs.deep-link"
+      RoleArn:
+          Fn::ImportValue: !Sub '${IAMStackname}-AmazonCloudWatchEventRole'
+
+  ## Connection to GitHub
+  gitHubConn:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: 'demoInfraGitHubConnection'
+      ProviderType: 'GitHub'
+      Tags:
+        - Key: Team
+          Value: RackspaceEE
+
+  ValidationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/demo/Validate-CFN-Templates-stage-${AWS::AccountId}-${AWS::Region}"
+      RetentionInDays: 90
+      Tags:
+        - Key: Team
+          Value: RackspaceEE
+
+  CodeBuildValidateProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-check.yaml
+      Environment:
+          Type: LINUX_CONTAINER
+          Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+          ImagePullCredentialsType: CODEBUILD
+          ComputeType: BUILD_GENERAL1_SMALL
+          PrivilegedMode: false
+          EnvironmentVariables:
+            - Name: TEMPLATE_PREFIX
+              Value: codebuild
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref ValidationLogGroup
+          Status: ENABLED
+      Name: Validate-CFN-Templates
+      ServiceRole: 
+        Fn::ImportValue: !Sub '${IAMStackname}-CodeBuildRole'
+
+  CopyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/demo/Copy-CFN-Templates-stage-${AWS::AccountId}-${AWS::Region}"
+      RetentionInDays: 90
+      Tags:
+        - Key: Team
+          Value: RackspaceEE
+
+  Pipeline:
+    DependsOn:
+      - gitHubConn
+      - CodeBuildValidateProject
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Type: S3
+        Location: !Sub '${PipelineArtifactsBucket}'
+      Name: demo-Infra-Pipeline
+      RestartExecutionOnUpdate: false
+      RoleArn:
+        Fn::ImportValue: !Sub '${IAMStackname}-PipelineRole'
+      Stages:
+        - Name: Checkout
+          Actions:
+            - Name: Source
+              RunOrder: 1
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: 1
+              Configuration:
+                ConnectionArn: !Ref gitHubConn
+                FullRepositoryId: !Sub '${GitHubRepositoryName}'
+                BranchName: !Sub '${GitHubIntegrationBranch}'
+              OutputArtifacts:
+                - Name: SourceArtifact
+        
+        - Name: Validation
+          Actions:
+            - Name: CheckCFNTemplates
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildValidateProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        - Name: StartProcess
+          Actions:
+            - Name: ApprovalToStartProcess
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: 1
+              Configuration:
+                NotificationArn: !GetAtt snsApprovalNotification.TopicArn
+                CustomData: 'Start process to check deployment'
+
+        - Name: CheckChangeSet
+          Actions:
+            - Name: CheckChangeSet
+              RunOrder: 1
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: OutputArtifact
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: CheckChangeSet
+                RoleArn:
+                  Fn::ImportValue: !Sub '${IAMStackname}-CloudFormationStackRole'
+                StackName: !Sub '${DeploymentStackName}'
+                TemplatePath: 'SourceArtifact::infrastructure.yaml'
+                Capabilities: CAPABILITY_NAMED_IAM
+
+        - Name: ApprovalToProduction
+          Actions:
+            - Name: ApprovalToMoveProduction
+              RunOrder: 1
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: 1
+              Configuration:
+                NotificationArn: !GetAtt snsApprovalNotification.TopicArn
+                CustomData: 'Approve deployment to move production'
+
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              RunOrder: 1
+              InputArtifacts:
+                - Name: OutputArtifact
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: CheckChangeSet
+                StackName: !Sub '${DeploymentStackName}'
